@@ -1,0 +1,912 @@
+**Multiplayer API Guidance**
+
+# @/runtime Coding Guidelines
+
+The Runtime library powers small multiplayer mobile games with three core primitives:
+- **KV** - Key-value storage for persistent game state
+- **Socket** - Realtime events for game communication
+- **Player** - Player presence and ephemeral state
+
+---
+
+## Multiplayer Game Requirements
+
+When generating a **multiplayer game**, you **MUST** implement a **room selection flow** in the main menu before players can start playing. This is a mandatory requirement for all multiplayer games.
+
+### Why Rooms?
+
+- Players create or join **rooms** to play together with friends
+- Each room supports **up to 4 players**
+- Room state is isolated: KV storage and socket events are scoped to the room
+- Players cannot interact across rooms
+
+### Required Room Selection Flow
+
+Every multiplayer game **MUST** include:
+
+1. **Main Menu** with options to:
+   - Create a new room
+   - Join an existing room (by room ID or from a list)
+   - See available rooms (optional but recommended)
+
+2. **Room Lobby** (after joining) with:
+   - List of players currently in the room
+   - Ready/waiting status for each player
+   - Start game button (when enough players are ready)
+   - Leave room option
+
+3. **Game Screen** - only accessible after successfully joining a room
+
+### Room Selector Business Logic Example
+
+Here's the recommended pattern for implementing room selection:
+
+```ts
+import { createRuntime, type AppRuntime } from "@/runtime";
+
+// Room state stored in globalKv (accessible without joining a room)
+interface RoomInfo {
+  id: string;
+  name: string;
+  hostId: string;
+  playerCount: number;
+  maxPlayers: number;
+  status: "waiting" | "playing" | "finished";
+  createdAt: number;
+}
+
+// Initialize a "lobby runtime" for room management (uses a special "__lobby__" room)
+async function createLobbyRuntime(appId: string, userId: string): Promise<AppRuntime> {
+  return createRuntime(appId, "__lobby__", userId);
+}
+
+// Fetch all available rooms for this app
+async function getAvailableRooms(lobbyRuntime: AppRuntime): Promise<RoomInfo[]> {
+  const rooms = await lobbyRuntime.globalKv.list<RoomInfo>("room:");
+  return Object.values(rooms)
+    .filter((room) => room.status === "waiting" && room.playerCount < room.maxPlayers)
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+// Create a new room
+async function createRoom(
+  lobbyRuntime: AppRuntime,
+  userId: string,
+  roomName: string
+): Promise<string> {
+  const roomId = generateRoomId(); // e.g., nanoid() or crypto.randomUUID()
+  const roomInfo: RoomInfo = {
+    id: roomId,
+    name: roomName,
+    hostId: userId,
+    playerCount: 0,
+    maxPlayers: 4,
+    status: "waiting",
+    createdAt: Date.now(),
+  };
+  await lobbyRuntime.globalKv.set(`room:${roomId}`, roomInfo);
+  return roomId;
+}
+
+// Join an existing room - returns the game runtime
+async function joinRoom(
+  appId: string,
+  roomId: string,
+  userId: string
+): Promise<AppRuntime | null> {
+  // First, create a lobby runtime to check room status
+  const lobbyRuntime = await createLobbyRuntime(appId, userId);
+  const roomInfo = await lobbyRuntime.globalKv.get<RoomInfo>(`room:${roomId}`);
+
+  if (!roomInfo) {
+    console.error("Room not found");
+    return null;
+  }
+
+  if (roomInfo.playerCount >= roomInfo.maxPlayers) {
+    console.error("Room is full");
+    return null;
+  }
+
+  if (roomInfo.status !== "waiting") {
+    console.error("Game already in progress");
+    return null;
+  }
+
+  // Update player count
+  await lobbyRuntime.globalKv.update<RoomInfo>(`room:${roomId}`, (room) => ({
+    ...room!,
+    playerCount: room!.playerCount + 1,
+  }));
+
+  // Create the actual game runtime for this room
+  const gameRuntime = await createRuntime(appId, roomId, userId);
+
+  // Set up leave handler to decrement player count
+  gameRuntime.socket.onLeave(async (player) => {
+    await lobbyRuntime.globalKv.update<RoomInfo>(`room:${roomId}`, (room) => {
+      if (!room) return room!;
+      return { ...room, playerCount: Math.max(0, room.playerCount - 1) };
+    });
+  });
+
+  return gameRuntime;
+}
+
+// Leave a room
+async function leaveRoom(appId: string, roomId: string, userId: string): Promise<void> {
+  const lobbyRuntime = await createLobbyRuntime(appId, userId);
+  await lobbyRuntime.globalKv.update<RoomInfo>(`room:${roomId}`, (room) => {
+    if (!room) return room!;
+    return { ...room, playerCount: Math.max(0, room.playerCount - 1) };
+  });
+}
+
+// Update room status when game starts
+async function startGame(lobbyRuntime: AppRuntime, roomId: string): Promise<void> {
+  await lobbyRuntime.globalKv.update<RoomInfo>(`room:${roomId}`, (room) => ({
+    ...room!,
+    status: "playing",
+  }));
+}
+
+// Clean up room when game ends
+async function endGame(lobbyRuntime: AppRuntime, roomId: string): Promise<void> {
+  await lobbyRuntime.globalKv.delete(`room:${roomId}`);
+}
+
+// Helper to generate a short, user-friendly room ID
+function generateRoomId(): string {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+```
+
+### Key Guidelines for Room Implementation
+
+1. **Always validate room state** before allowing players to join
+2. **Use `globalKv`** for room metadata (so it's accessible before joining)
+3. **Use room-scoped `kv`** for game state within the room
+4. **Handle player disconnects** - decrement player count on leave
+5. **Limit to 4 players** per room for optimal performance
+6. **Show room status** (waiting/playing) in the room list
+7. **Only the host** should be able to start the game
+
+---
+
+Do *not* use or import the types/patterns below; these are incorrect or deprecated:
+- **Incorrect** `new Runtime()` - there is no class constructor
+- **Incorrect** `runtime.connect()` - runtime is already connected on creation
+- **Incorrect** `socket.emit()` - use `socket.broadcast()` instead
+- **Incorrect** `socket.send()` - use `socket.broadcast()` instead
+- **Incorrect** `kv.save()` - use `kv.set()` instead
+- **Incorrect** `kv.load()` - use `kv.get()` instead
+- **Incorrect** `players.all()` - use `players.list()` instead
+- **Incorrect** `player.update()` - use `player.setState()` instead
+
+---
+
+## Critical: KV Writes in Event Handlers
+
+**NEVER write to KV inside a `socket.on()` handler without checking if the current user is the action owner.**
+
+When a player broadcasts an event, ALL players in the room receive it. If each player writes to KV in the handler, you get N redundant writes (where N = number of players).
+
+**Incorrect - causes N writes to Redis:**
+```ts
+// BAD: Every player in the room will execute this write!
+runtime.socket.on("playerScored", async (payload, player) => {
+  await runtime.kv.update<number>(`score:${player.id}`, (s) => (s ?? 0) + 1);
+});
+```
+
+**Correct - only the action owner writes:**
+```ts
+// GOOD: Only the player who scored writes to KV
+runtime.socket.on("playerScored", async (payload, player) => {
+  // Update UI for all players (read-only operation)
+  updateScoreDisplay(player.id, payload.score);
+});
+
+function handleScore(runtime: AppRuntime, userId: string) {
+  // The scoring player updates KV and broadcasts
+  runtime.kv.update<number>(`score:${userId}`, (s) => (s ?? 0) + 1);
+  runtime.socket.broadcast("playerScored", { odcplayerId: odcuserId, score: newScore });
+}
+```
+
+**Alternative - guard with userId check:**
+```ts
+// GOOD: Only execute KV write if this client is the action owner
+runtime.socket.on("playerScored", async (payload, player) => {
+  if (player.id === odcuserId) {
+    // Only the originating player writes to KV
+    await runtime.kv.update<number>(`score:${player.id}`, (s) => (s ?? 0) + 1);
+  }
+  // All players update their UI
+  updateScoreDisplay(player.id);
+});
+```
+
+**Rule of thumb:**
+- Use `socket.on()` handlers for **UI updates only** (rendering, animations, sounds)
+- Perform **KV writes in the action function** that calls `broadcast()`, not in the receiver
+- If you must write in a handler, **guard with `if (player.id === userId)`**
+
+---
+
+## Initialization
+
+Always use `createRuntime` to initialize the runtime. It returns a Promise that resolves to an `AppRuntime` instance.
+
+```ts
+import { createRuntime } from "@/runtime";
+
+const runtime = await createRuntime(appId, roomId, userId);
+```
+
+**Parameters:**
+- `appId` - Unique identifier for the game/app
+- `roomId` - Unique identifier for the game room/session
+- `userId` - Unique identifier for the current player
+
+**Incorrect patterns:**
+- `createRuntime(appId)` - missing `roomId` and `userId`
+- `createRuntime({ appId, roomId, userId })` - must use positional arguments, not an object
+- `new AppRuntime(...)` - use the `createRuntime` function
+
+---
+
+## Environment Variables
+
+The runtime requires the following environment variables to be pre-configured:
+- `REDIS_URL` - Redis connection URL for KV storage
+- `NEXT_PUBLIC_SOCKET_URL` or `SOCKET_URL` - WebSocket server endpoint
+
+Assume these variables are pre-configured, valid, and accessible. Do **not** generate UI elements or code for entering or managing these values.
+
+---
+
+## AppRuntime Interface
+
+The `createRuntime` function returns an `AppRuntime` object with the following properties:
+
+```ts
+interface AppRuntime {
+  appId: string;      // The app identifier
+  roomId: string;     // The room identifier
+  kv: KV;             // Room-scoped key-value storage
+  globalKv: KV;       // App-scoped key-value storage (shared across rooms)
+  socket: AppSocket;  // Realtime events for the room
+  players: Players;   // Current players in the room
+}
+```
+
+---
+
+## KV Storage
+
+The runtime provides two KV stores:
+- `kv` - Room-scoped storage, isolated per (appId, roomId). Use for game session state.
+- `globalKv` - App-scoped storage, shared across all rooms. Use for leaderboards, user profiles, etc.
+
+### Reading a Value
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// Read a value (returns null if key doesn't exist)
+const score = await runtime.kv.get<number>("score");
+console.log(score); // number | null
+```
+
+**Incorrect patterns:**
+- `runtime.kv.get("score")` without `await` - `get` returns a Promise
+- `runtime.kv.get("score", defaultValue)` - no default value parameter, check for null instead
+
+### Writing a Value
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// Write a value (JSON-serializable)
+await runtime.kv.set("score", 100);
+await runtime.kv.set("player:abc", { name: "Alice", level: 5 });
+await runtime.kv.set("gameState", { round: 1, status: "playing" });
+```
+
+**Supported value types:**
+- `null`
+- `boolean`
+- `number`
+- `string`
+- `Json[]` (arrays)
+- `{ [key: string]: Json }` (objects)
+
+**Incorrect patterns:**
+- `runtime.kv.set("key", undefined)` - use `null` instead of `undefined`
+- `runtime.kv.set("key", new Date())` - Date objects are not JSON-serializable, use `.toISOString()`
+- `runtime.kv.set("key", functionRef)` - functions are not serializable
+
+### Deleting a Value
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+await runtime.kv.delete("score");
+```
+
+### Listing Values by Prefix
+
+Use `list` to retrieve all keys matching a prefix. Returns a map of `suffixKey -> value`.
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// Store scores for multiple players
+await runtime.kv.set("score:player1", 100);
+await runtime.kv.set("score:player2", 250);
+await runtime.kv.set("score:player3", 75);
+
+// List all scores
+const scores = await runtime.kv.list<number>("score:");
+console.log(scores);
+// Output: { "score:player1": 100, "score:player2": 250, "score:player3": 75 }
+```
+
+### Atomic Updates
+
+Use `update` for read-modify-write operations. The callback receives the current value and must return the new value.
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// Increment a counter atomically
+await runtime.kv.update<number>("clickCount", (current) => (current ?? 0) + 1);
+
+// Update an object atomically
+await runtime.kv.update<{ coins: number; gems: number }>("inventory", (current) => ({
+  coins: (current?.coins ?? 0) + 10,
+  gems: current?.gems ?? 0,
+}));
+```
+
+**Important:** The `update` function is atomic on the server (uses Redis WATCH/MULTI). Always use `update` when multiple clients may modify the same key concurrently.
+
+**Incorrect patterns:**
+- Reading then writing separately for concurrent updates:
+  ```ts
+  // BAD: Race condition possible
+  const count = await runtime.kv.get<number>("count");
+  await runtime.kv.set("count", (count ?? 0) + 1);
+
+  // GOOD: Atomic update
+  await runtime.kv.update<number>("count", (c) => (c ?? 0) + 1);
+  ```
+
+### Global KV vs Room KV
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// Room-scoped: only accessible within this room
+await runtime.kv.set("roundNumber", 3);
+
+// App-scoped: accessible from any room in the app
+await runtime.globalKv.set(`leaderboard:${odcuserId}`, { score: 500, name: "Alice" });
+
+// Fetch global leaderboard from any room
+const leaderboard = await runtime.globalKv.list<{ score: number; name: string }>("leaderboard:");
+```
+
+---
+
+## Socket (Realtime Events)
+
+The `socket` primitive enables realtime communication between all players in a room.
+
+### Broadcasting Events
+
+Use `broadcast` to send an event to all players in the room, including the sender.
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// Broadcast a game event
+runtime.socket.broadcast("playerMoved", { x: 100, y: 200 });
+
+// Broadcast with complex payload
+runtime.socket.broadcast("gameAction", {
+  action: "attack",
+  target: "enemy1",
+  damage: 25,
+});
+```
+
+**Incorrect patterns:**
+- `socket.emit("event", data)` - use `broadcast` instead
+- `socket.send("event", data)` - use `broadcast` instead
+- `await socket.broadcast(...)` - `broadcast` is synchronous (fire-and-forget)
+
+### Listening for Events
+
+Use `on` to subscribe to events broadcast by any player in the room.
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// Listen for player movement
+runtime.socket.on("playerMoved", (payload, player) => {
+  console.log(`Player ${player.id} moved to`, payload);
+  // payload: { x: 100, y: 200 }
+  // player: { id: string, state: Record<string, Json>, setState: function }
+});
+
+// Listen for game actions
+runtime.socket.on("gameAction", (payload, player) => {
+  const { action, target, damage } = payload as {
+    action: string;
+    target: string;
+    damage: number;
+  };
+  console.log(`${player.id} performed ${action} on ${target}`);
+});
+```
+
+**Handler signature:** `(payload: Json, player: Player) => void`
+- `payload` - The data broadcast with the event
+- `player` - The player who broadcast the event
+
+### Presence Events
+
+Subscribe to player join/leave events to track presence.
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// When a player joins the room
+runtime.socket.onJoin((player) => {
+  console.log(`${player.id} joined the room`);
+  console.log("Player state:", player.state);
+});
+
+// When a player leaves the room
+runtime.socket.onLeave((player) => {
+  console.log(`${player.id} left the room`);
+});
+```
+
+---
+
+## Players (Presence)
+
+The `players` primitive provides a snapshot of all connected players in the room.
+
+### Getting a Player
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+const player = runtime.players.get("player123");
+if (player) {
+  console.log("Player ID:", player.id);
+  console.log("Player state:", player.state);
+}
+```
+
+### Listing All Players
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+const allPlayers = runtime.players.list();
+allPlayers.forEach((player) => {
+  console.log(`${player.id}: ${JSON.stringify(player.state)}`);
+});
+```
+
+### Counting Players
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+const playerCount = runtime.players.count();
+console.log(`${playerCount} players in the room`);
+
+// Example: Start game when enough players
+if (runtime.players.count() >= 2) {
+  runtime.socket.broadcast("gameStart", { timestamp: Date.now() });
+}
+```
+
+---
+
+## Player State
+
+Each player has ephemeral state that exists only while connected. Use for transient data like cursor position, ready status, or current selection.
+
+### Setting Player State
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// Get the current player from the players list
+const self = runtime.players.get(userId);
+if (self) {
+  // Update player state (broadcasts to all players automatically)
+  self.setState({ ready: true });
+  self.setState({ position: { x: 100, y: 200 } });
+  self.setState({ selectedCard: "ace_of_spades" });
+}
+```
+
+**Important:** Player state is ephemeral and lost on disconnect. For persistent state, use `kv`.
+
+### Reading Player State
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// Read another player's state
+const opponent = runtime.players.get("opponent123");
+if (opponent) {
+  const isReady = opponent.state.ready as boolean;
+  const position = opponent.state.position as { x: number; y: number };
+}
+
+// List all ready players
+const readyPlayers = runtime.players.list().filter((p) => p.state.ready === true);
+```
+
+---
+
+## Complete Game Example
+
+Here's a complete example of a simple tap-counting multiplayer game:
+
+```ts
+import { createRuntime, type AppRuntime, type Player } from "@/runtime";
+
+async function initGame(appId: string, roomId: string, userId: string) {
+  const runtime = await createRuntime(appId, roomId, userId);
+
+  // Initialize player state
+  const self = runtime.players.get(userId);
+  self?.setState({ score: 0, ready: false });
+
+  // Handle new players joining
+  runtime.socket.onJoin((player) => {
+    console.log(`${player.id} joined!`);
+    updatePlayerList(runtime);
+  });
+
+  // Handle players leaving
+  runtime.socket.onLeave((player) => {
+    console.log(`${player.id} left!`);
+    updatePlayerList(runtime);
+  });
+
+  // Handle tap events - UI updates only, no KV writes here!
+  runtime.socket.on("tap", (payload, player) => {
+    const { score } = payload as { score: number };
+    // Update UI to show the tapping player's new score
+    updateScoreDisplay(player.id, score);
+  });
+
+  // Handle game start
+  runtime.socket.on("gameStart", (payload) => {
+    console.log("Game started!");
+    startGameLoop(runtime);
+  });
+
+  return runtime;
+}
+
+function updatePlayerList(runtime: AppRuntime) {
+  const players = runtime.players.list();
+  console.log(`Players in room: ${players.map((p) => p.id).join(", ")}`);
+}
+
+async function handleTap(runtime: AppRuntime, userId: string) {
+  // The tapping player updates their own score in KV
+  await runtime.kv.update<number>(`score:${userId}`, (s) => (s ?? 0) + 1);
+  const newScore = await runtime.kv.get<number>(`score:${userId}`);
+
+  // Update local player state
+  const self = runtime.players.get(userId);
+  self?.setState({ score: newScore ?? 0 });
+
+  // Broadcast to all players for UI sync (they won't write to KV)
+  runtime.socket.broadcast("tap", { score: newScore });
+}
+
+async function getLeaderboard(runtime: AppRuntime) {
+  const scores = await runtime.kv.list<number>("score:");
+  const sorted = Object.entries(scores)
+    .map(([key, score]) => ({ playerId: key.replace("score:", ""), score }))
+    .sort((a, b) => b.score - a.score);
+  return sorted;
+}
+
+function setReady(runtime: AppRuntime, userId: string) {
+  const self = runtime.players.get(userId);
+  self?.setState({ ready: true });
+
+  // Check if all players are ready
+  const allReady = runtime.players.list().every((p) => p.state.ready === true);
+  if (allReady && runtime.players.count() >= 2) {
+    runtime.socket.broadcast("gameStart", {});
+  }
+}
+```
+
+---
+
+## Type Definitions
+
+### Json
+
+```ts
+type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+```
+
+### KV
+
+```ts
+interface KV {
+  get<T = Json>(key: string): Promise<T | null>;
+  set(key: string, value: Json): Promise<void>;
+  delete(key: string): Promise<void>;
+  list<T = Json>(prefix: string): Promise<Record<string, T>>;
+  update<T = Json>(key: string, fn: (cur: T | null) => T): Promise<void>;
+}
+```
+
+### Player
+
+```ts
+interface Player {
+  id: string;
+  state: Record<string, Json>;
+  setState(partial: Record<string, Json>): void;
+}
+```
+
+### Players
+
+```ts
+interface Players {
+  get(id: string): Player | undefined;
+  list(): Player[];
+  count(): number;
+}
+```
+
+### AppSocket
+
+```ts
+interface AppSocket {
+  on(event: string, handler: (payload: Json, player: Player) => void): void;
+  broadcast(event: string, payload: Json): void;
+  onJoin(handler: (player: Player) => void): void;
+  onLeave(handler: (player: Player) => void): void;
+}
+```
+
+---
+
+## Common Patterns
+
+### Waiting for Minimum Players
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+const MIN_PLAYERS = 2;
+
+// Check if game can start - called only by the player who triggered the condition
+function checkCanStart(): boolean {
+  if (runtime.players.count() >= MIN_PLAYERS) {
+    const allReady = runtime.players.list().every((p) => p.state.ready);
+    return allReady;
+  }
+  return false;
+}
+
+// Called when this player clicks "Ready"
+function setReady() {
+  const self = runtime.players.get(userId);
+  self?.setState({ ready: true });
+  runtime.socket.broadcast("playerReady", { playerId: userId });
+
+  // Only the player who set ready checks and potentially starts
+  if (checkCanStart()) {
+    runtime.socket.broadcast("gameStart", { timestamp: Date.now() });
+  }
+}
+
+// Listen for other players' ready state - UI update only
+runtime.socket.on("playerReady", (payload, player) => {
+  updateReadyIndicator(player.id, true);
+  // Do NOT call broadcast("gameStart") here - would cause N broadcasts!
+});
+
+// Listen for game start - all players react to UI
+runtime.socket.on("gameStart", (payload) => {
+  const { timestamp } = payload as { timestamp: number };
+  startGame(timestamp);
+});
+```
+
+### Turn-Based Game
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// Listen for turn changes - UI update only
+runtime.socket.on("turnChange", (payload) => {
+  const { playerId } = payload as { playerId: string };
+  updateTurnIndicator(playerId);
+  setInputEnabled(playerId === userId);
+});
+
+// Listen for actions - UI update only, no KV writes
+runtime.socket.on("action", (payload, player) => {
+  const { action, result } = payload as { action: string; result: unknown };
+  // Animate the action for all players
+  renderAction(player.id, action, result);
+});
+
+// Called when the current player performs an action
+async function performAction(action: string) {
+  // Validate it's our turn
+  const turnIndex = await runtime.kv.get<number>("currentTurnIndex");
+  const players = runtime.players.list();
+  const currentPlayer = players[turnIndex ?? 0];
+
+  if (currentPlayer.id !== userId) {
+    console.log("Not your turn!");
+    return;
+  }
+
+  // Process the action and compute result
+  const result = processAction(action);
+
+  // Advance turn (only the acting player writes to KV)
+  const nextIndex = ((turnIndex ?? 0) + 1) % players.length;
+  await runtime.kv.set("currentTurnIndex", nextIndex);
+
+  // Broadcast action result and new turn to all players
+  runtime.socket.broadcast("action", { action, result });
+  runtime.socket.broadcast("turnChange", { playerId: players[nextIndex].id });
+}
+```
+
+### Synchronized Game Timer
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+// Called by the player who initiates the round (e.g., host)
+async function startRound(durationMs: number) {
+  const endTime = Date.now() + durationMs;
+  await runtime.kv.set("roundEndTime", endTime);
+  runtime.socket.broadcast("roundStart", { endTime, startedBy: userId });
+
+  // Only the initiator sets the timer to end the round
+  setTimeout(() => {
+    runtime.socket.broadcast("roundEnd", {});
+  }, durationMs);
+}
+
+// All players listen for round events - UI updates only
+runtime.socket.on("roundStart", (payload) => {
+  const { endTime } = payload as { endTime: number; startedBy: string };
+  const remaining = endTime - Date.now();
+  // Start local countdown display (UI only, no broadcasts)
+  startCountdownUI(remaining);
+});
+
+runtime.socket.on("roundEnd", () => {
+  // All players update their UI
+  showRoundEndScreen();
+});
+```
+
+### Persisting High Scores
+
+```ts
+const runtime = await createRuntime(appId, roomId, userId);
+
+async function submitScore(playerId: string, score: number) {
+  // Update global leaderboard (persists across rooms)
+  await runtime.globalKv.update<{ score: number; timestamp: number }>(
+    `highscore:${playerId}`,
+    (current) => {
+      if (!current || score > current.score) {
+        return { score, timestamp: Date.now() };
+      }
+      return current;
+    }
+  );
+}
+
+async function getTopScores(limit: number = 10) {
+  const allScores = await runtime.globalKv.list<{ score: number; timestamp: number }>("highscore:");
+  return Object.entries(allScores)
+    .map(([key, data]) => ({ playerId: key.replace("highscore:", ""), ...data }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+```
+
+---
+
+## Error Handling
+
+The runtime may throw errors in the following cases:
+
+- `REDIS_URL is not configured` - Environment variable missing
+- `Socket endpoint is not configured` - Socket URL environment variable missing
+- `KV update failed after retries` - Atomic update failed due to contention
+
+Handle errors appropriately:
+
+```ts
+try {
+  const runtime = await createRuntime(appId, roomId, userId);
+} catch (error) {
+  console.error("Failed to initialize runtime:", error);
+  // Show user-friendly error message
+}
+
+try {
+  await runtime.kv.update("counter", (c) => (c ?? 0) + 1);
+} catch (error) {
+  if (error.message.includes("KV update failed")) {
+    // Retry or handle contention
+  }
+}
+```
+
+---
+
+## Best Practices
+
+### DO
+- ✅ Perform KV writes in the action function that calls `broadcast()`, not in `socket.on()` receivers
+- ✅ Use `socket.on()` handlers for UI updates only (rendering, animations, sounds)
+- ✅ Use `kv.update()` for concurrent modifications
+- ✅ Use `globalKv` for cross-room data like leaderboards
+- ✅ Use `player.setState()` for ephemeral UI state
+- ✅ Use `kv` for game state that must survive reconnects
+- ✅ Type your KV values with generics: `kv.get<GameState>("state")`
+- ✅ Handle `onJoin` and `onLeave` for presence tracking
+- ✅ Validate event payloads with type assertions
+
+### DON'T
+- ❌ Write to KV inside `socket.on()` handlers without guarding with `player.id === userId`
+- ❌ Call `socket.broadcast()` inside `socket.on()` handlers (causes N broadcasts per event)
+- ❌ Store large objects in player state (keep it minimal)
+- ❌ Use `kv.get` + `kv.set` for concurrent updates (use `kv.update`)
+- ❌ Assume player state persists after disconnect
+- ❌ Broadcast high-frequency events (throttle if needed)
+- ❌ Store sensitive data in KV without encryption
+- ❌ Forget to handle the case when `players.get()` returns `undefined`
+
+---
+
+## Import Summary
+
+```ts
+// Main runtime creation
+import { createRuntime } from "@/runtime";
+
+// Types (for TypeScript)
+import type {
+  AppRuntime,
+  AppSocket,
+  KV,
+  Player,
+  Players,
+  Json,
+} from "@/runtime";
+```
