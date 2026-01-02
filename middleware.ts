@@ -1,10 +1,17 @@
-import { generateUUID } from '@/utils';
+import { generateUUID } from '@/lib/utils';
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
 const SESSION_COOKIE = 'session-id';
 
 export function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  if (pathname === '/') {
+    const chatId = generateUUID();
+    return NextResponse.redirect(new URL(`/chat/${chatId}`, request.url));
+  }
+
   const response = NextResponse.next();
 
   if (!request.cookies.get(SESSION_COOKIE)) {
